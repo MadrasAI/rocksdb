@@ -174,11 +174,11 @@ void RWMutex::WriteUnlock() {
 }
 
 int PhysicalCoreID() {
-#if defined(ROCKSDB_SCHED_GETCPU_PRESENT) && defined(__x86_64__) && \
+#if defined(ROCKSDB_SCHED_GETCPU_PRESENT) && \
     (__GNUC__ > 2 || (__GNUC__ == 2 && __GNUC_MINOR__ >= 22))
-  // sched_getcpu uses VDSO getcpu() syscall since 2.22. I believe Linux offers
-  // VDSO support only on x86_64. This is the fastest/preferred method if
-  // available.
+  // sched_getcpu uses VDSO getcpu() syscall since glibc 2.22. Linux VDSO
+  // getcpu is available on x86_64 and AArch64 (since kernel 4.1).
+  // This is the fastest/preferred method if available.
   int cpuno = sched_getcpu();
   if (cpuno < 0) {
     return -1;

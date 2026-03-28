@@ -25,7 +25,7 @@
 #else
 #include <x86intrin.h>
 #endif
-#else
+#elif !defined(__aarch64__)
 #include "rocksdb/system_clock.h"
 #endif
 
@@ -191,6 +191,10 @@ void UnpredictableUniqueIdGen::GenerateNext(uint64_t* upper, uint64_t* lower) {
   // if unavailable on some platforms. High performance is important.)
 #ifdef __SSE4_2__  // More than enough to guarantee rdtsc instruction
   extra_entropy = static_cast<uint64_t>(_rdtsc());
+#elif defined(__aarch64__)
+  // AArch64 virtual counter register; readable from userspace via VDSO
+  // since Linux 4.1 / ARMv8-A. Low latency, no syscall overhead.
+  asm volatile("mrs %0, cntvct_el0" : "=r"(extra_entropy));
 #else
   extra_entropy = SystemClock::Default()->NowNanos();
 #endif
