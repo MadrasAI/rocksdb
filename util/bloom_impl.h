@@ -20,6 +20,9 @@
 #ifdef __AVX2__
 #include <immintrin.h>
 #endif
+#ifdef __aarch64__
+#include <arm_neon.h>
+#endif
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -330,6 +333,90 @@ class FastLocalBloomImpl {
       // Need another iteration. 0xab25f4c1 == golden ratio to the 8th power
       h *= 0xab25f4c1;
       rem_probes -= 8;
+    }
+#elif defined(__aarch64__)
+    // NEON path for AArch64. Processes 4 probes per loop iteration
+    // (vs. 8 for AVX2) using 128-bit NEON vectors.
+    //
+    // The 64-byte cache line holds 16 x 32-bit words. For each probe:
+    //   1. hash[i] = h * golden_ratio^i
+    //   2. bits [31:28] → 4-bit word address (0–15) in the cache line
+    //   3. bits [8:4]   → 5-bit bit-within-word address (0–31)
+    //   4. check that the addressed bit is set in the gathered word
+    //
+    // Gather: vqtbl4q_u8 performs a byte-indexed lookup across 64 bytes
+    // held in four 128-bit registers — the AArch64 equivalent of the AVX2
+    // permutevar8x32 + blend. vminvq_u32 collapses four lane comparisons
+    // to a single scalar for the branch decision.
+    int rem_probes = num_probes;
+
+    // First four powers of the 32-bit golden ratio (0x9e3779b9^k mod 2^32).
+    static const uint32_t kMultipliers[4] = {0x00000001u, 0x9e3779b9u,
+                                              0xe35e67b1u, 0x734297e9u};
+    // {0,1,2,3} byte offset within a 4-byte word, repeated once per probe.
+    static const uint8_t kByteOffsets[16] = {0, 1, 2, 3, 0, 1, 2, 3,
+                                              0, 1, 2, 3, 0, 1, 2, 3};
+    // Per-lane indices for the k_selector active-probe mask.
+    static const uint32_t kLaneIds[4] = {0u, 1u, 2u, 3u};
+
+    const uint32x4_t multipliers = vld1q_u32(kMultipliers);
+    const uint8x16_t byte_offsets = vld1q_u8(kByteOffsets);
+    const uint32x4_t lane_ids = vld1q_u32(kLaneIds);
+
+    // Load the 64-byte cache line once as four 128-bit registers for
+    // vqtbl4q_u8 (AArch64 64-byte table lookup).
+    const uint8x16x4_t cache_data =
+        vld1q_u8_x4(reinterpret_cast<const uint8_t*>(data_at_cache_line));
+
+    for (;;) {
+      // 1. Four hash values: hash_vec[i] = h * golden_ratio^i.
+      const uint32x4_t hash_vec = vmulq_u32(vdupq_n_u32(h), multipliers);
+
+      // 2. Gather: select the 32-bit cache-line word for each probe.
+      //    Word address = hash_vec >> 28 (bits [31:28], value 0–15).
+      //    Byte base    = word_address * 4 (fits in uint8: max 60).
+      //    Build a 16-byte vqtbl4q_u8 index via two vzip_u8 passes that
+      //    repeat each base into four consecutive slots, then add {0,1,2,3}.
+      const uint8x8_t byte_bases =
+          vshl_n_u8(vmovn_u16(vcombine_u16(
+                        vmovn_u32(vshrq_n_u32(hash_vec, 28)), vdup_n_u16(0))),
+                    2);
+      const uint8x8x2_t z1 = vzip_u8(byte_bases, byte_bases);
+      const uint8x8x2_t z2 = vzip_u8(z1.val[0], z1.val[0]);
+      const uint8x16_t byte_idx =
+          vaddq_u8(vcombine_u8(z2.val[0], z2.val[1]), byte_offsets);
+      const uint32x4_t value_vec =
+          vreinterpretq_u32_u8(vqtbl4q_u8(cache_data, byte_idx));
+
+      // 3. Build per-probe bit masks.
+      //    Bit address = bits [8:4] of hash_vec (shift left 4, right 27).
+      //    k_selector[i] = 1 if lane i < rem_probes (active), 0 otherwise;
+      //                    extracted as the sign bit of (lane_id - rem_probes).
+      //    bit_mask[i]   = k_selector[i] << bit_address[i].
+      const uint32x4_t bit_addrs =
+          vshrq_n_u32(vshlq_n_u32(hash_vec, 4), 27);
+      const uint32x4_t k_sel = vshrq_n_u32(
+          vsubq_u32(lane_ids, vdupq_n_u32(static_cast<uint32_t>(rem_probes))),
+          31);
+      const uint32x4_t bit_mask =
+          vshlq_u32(k_sel, vreinterpretq_s32_u32(bit_addrs));
+
+      // 4. All active bits must be set in the addressed words.
+      //    vceqq_u32 yields 0xFFFFFFFF per passing lane, 0 per failing lane.
+      //    vminvq_u32 reduces to a single value: non-zero iff all lanes pass.
+      //    Inactive lanes always pass: bit_mask[i]==0 → (val & 0)==0==mask ✓
+      const bool match =
+          vminvq_u32(vceqq_u32(vandq_u32(value_vec, bit_mask), bit_mask)) != 0;
+
+      // Same exit logic as the AVX2 path.
+      if (rem_probes <= 4) {
+        return match;
+      } else if (!match) {
+        return false;
+      }
+      // 0x35fbe861 = golden ratio to the 4th power (mod 2^32).
+      h *= 0x35fbe861u;
+      rem_probes -= 4;
     }
 #else
     for (int i = 0; i < num_probes; ++i, h *= uint32_t{0x9e3779b9}) {
