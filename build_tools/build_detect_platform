@@ -672,10 +672,27 @@ if [ "$PORTABLE" == "" ] || [ "$PORTABLE" == 0 ]; then
     POWER=`LD_SHOW_AUXV=1 /bin/true | grep AT_PLATFORM | grep -E -o power[0-9]+`
     COMMON_FLAGS="$COMMON_FLAGS -mcpu=$POWER -mtune=$POWER "
   elif test -n "`echo $TARGET_ARCHITECTURE | grep -e^arm -e^aarch64`"; then
-    # TODO: Handle this with approprite options.
-    COMMON_FLAGS="$COMMON_FLAGS"
-  elif test -n "`echo $TARGET_ARCHITECTURE | grep ^aarch64`"; then
-    COMMON_FLAGS="$COMMON_FLAGS"
+    # Detect specific ARM microarchitecture from /proc/cpuinfo CPU part field.
+    # CPU part 0xd40 = Neoverse V1 (AWS Graviton3, armv8.4-a + SVE + crypto).
+    # CPU part 0xd0c = Neoverse N1 (AWS Graviton2, armv8.2-a + crypto).
+    # Fall back to armv8-a+crc+crypto for unrecognised aarch64 cores.
+    # Use -march= (not -mcpu=) so the Makefile's own -march=armv8-a+crc+crypto
+    # detection (which enables __ARM_FEATURE_CRC32) does not conflict: two
+    # -march= flags are compatible; the last one wins without a warning.
+    # Use -mtune= separately for scheduling without altering the ISA level.
+    AARCH64_CPU_PART=$(grep -m1 '^CPU part' /proc/cpuinfo 2>/dev/null | awk '{print $NF}')
+    if [ "$AARCH64_CPU_PART" = "0xd40" ] && \
+       echo 'int main(){}' | $CXX -march=armv8.4-a+crc+crypto+sve -mtune=neoverse-v1 -x c++ - -o /dev/null 2>/dev/null; then
+      # Neoverse V1 (AWS Graviton3): armv8.4-a, 256-bit SVE, crc32, crypto, i8mm, bf16
+      COMMON_FLAGS="$COMMON_FLAGS -march=armv8.4-a+crc+crypto+sve -mtune=neoverse-v1"
+    elif [ "$AARCH64_CPU_PART" = "0xd0c" ] && \
+         echo 'int main(){}' | $CXX -march=armv8.2-a+crc+crypto -mtune=neoverse-n1 -x c++ - -o /dev/null 2>/dev/null; then
+      # Neoverse N1 (AWS Graviton2): armv8.2-a, crc32, crypto
+      COMMON_FLAGS="$COMMON_FLAGS -march=armv8.2-a+crc+crypto -mtune=neoverse-n1"
+    elif echo 'int main(){}' | $CXX -march=armv8-a+crc+crypto -x c++ - -o /dev/null 2>/dev/null; then
+      # Generic aarch64 with CRC32 and crypto extensions
+      COMMON_FLAGS="$COMMON_FLAGS -march=armv8-a+crc+crypto"
+    fi
   elif test -n "`echo $TARGET_ARCHITECTURE | grep ^s390x`"; then
     if echo 'int main() {}' | $CXX $PLATFORM_CXXFLAGS -x c++ \
       -march=native - -o /dev/null 2>/dev/null; then
