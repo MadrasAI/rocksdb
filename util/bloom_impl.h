@@ -20,6 +20,9 @@
 #ifdef __AVX2__
 #include <immintrin.h>
 #endif
+#ifdef __ARM_FEATURE_SVE
+#include <arm_sve.h>
+#endif
 #ifdef __aarch64__
 #include <arm_neon.h>
 #endif
@@ -333,6 +336,92 @@ class FastLocalBloomImpl {
       // Need another iteration. 0xab25f4c1 == golden ratio to the 8th power
       h *= 0xab25f4c1;
       rem_probes -= 8;
+    }
+#elif defined(__ARM_FEATURE_SVE)
+    // SVE path for Graviton3 / Neoverse V1 (256-bit SVE = 8 uint32 lanes).
+    // Processes 8 probes per iteration — one iteration covers all probes for
+    // the typical num_probes <= 8 case (e.g. 6 probes at 10 bits/key).
+    //
+    // Key improvement over the NEON path: uses svld1_gather_u32offset_u32
+    // (native SVE scatter-gather) to load exactly the 32-bit word for each
+    // probe from the 64-byte cache line, rather than the vqtbl4q_u8 workaround
+    // that loads all 64 bytes before doing an indexed byte pick.
+    //
+    // Hash layout (same as AVX2 and NEON paths):
+    //   hash[i] = h * kMults[i]
+    //   word offset in cache line = (hash >> 28) << 2   (0,4,8,...,60)
+    //   bit address within word   = (hash >> 23) & 31
+    //
+    // kMults[0..3] = golden_ratio^{0..3}.  kMults[4..7] = golden_ratio^4 *
+    // kMults[0..3] (so the two halves share the same Weyl structure as two
+    // consecutive NEON iterations). After 8 probes, h *= golden_ratio^8
+    // (0xab25f4c1) — identical to the AVX2 path advancement constant.
+    {
+      int rem_probes = num_probes;
+
+      // Eight golden-ratio multipliers: kMults[i] = golden_ratio^i mod 2^32.
+      // kMults[4..7] = 0x35fbe861 * kMults[0..3] mod 2^32 (golden_ratio^4
+      // applied to the first four), matching two consecutive NEON iterations.
+      static const uint32_t kMults[8] = {
+          0x00000001u, 0x9e3779b9u, 0xe35e67b1u, 0x734297e9u,
+          0x35fbe861u, 0xdeb7c719u, 0x0448b211u, 0x3459b749u,
+      };
+      const svuint32_t multipliers = svld1_u32(svptrue_b32(), kMults);
+
+      for (;;) {
+        // 1. Compute 8 independent hashes: hash_vec[i] = h * kMults[i].
+        const svuint32_t hash_vec =
+            svmul_u32_x(svptrue_b32(), svdup_n_u32(h), multipliers);
+
+        // 2. Gather: for each probe, load the 32-bit word it addresses.
+        //    word_byte_offset = (hash >> 28) << 2  (values 0,4,...,60).
+        //    svld1_gather_u32offset_u32 loads word i from
+        //    (uint8_t*)data_at_cache_line + word_byte_offset[i].
+        const svuint32_t word_offsets = svlsl_n_u32_x(
+            svptrue_b32(), svlsr_n_u32_x(svptrue_b32(), hash_vec, 28), 2);
+        const svuint32_t values = svld1_gather_u32offset_u32(
+            svptrue_b32(),
+            reinterpret_cast<const uint32_t*>(data_at_cache_line),
+            word_offsets);
+
+        // 3. Bit address within word: bits [27:23] of hash (5 bits, 0..31).
+        const svuint32_t bit_addrs = svand_n_u32_x(
+            svptrue_b32(), svlsr_n_u32_x(svptrue_b32(), hash_vec, 23), 31u);
+
+        // 4. Build per-probe bit masks: 1u << bit_addr[i].
+        //    svlsl_u32_x accepts svuint32_t shift amounts directly.
+        const svuint32_t bit_masks =
+            svlsl_u32_x(svptrue_b32(), svdup_n_u32(1u), bit_addrs);
+
+        // 5. Active-probe predicate: first min(rem_probes, 8) lanes.
+        //    svwhilelt_b32(0, n) sets elements 0..n-1 true.
+        const svbool_t active =
+            svwhilelt_b32(static_cast<int32_t>(0),
+                          static_cast<int32_t>(rem_probes));
+
+        // 6. All active probes must have their bit set in the gathered word.
+        //    masked[i] = values[i] & bit_masks[i]  (0 for inactive lanes).
+        //    diff[i]   = bit_masks[i] - masked[i]:
+        //      bit set     → diff == 0
+        //      bit not set → diff == bit_masks > 0
+        //    svmaxv_u32(active, diff) == 0 iff every active probe matched.
+        //    (min would be wrong: min==0 if ANY probe hit, not all probes hit.
+        //     max==0 only if ALL diff values are 0, i.e., all bits were set.)
+        //    (svptest_all unavailable in GCC SVE1 ACLE; this avoids it.)
+        const svuint32_t masked = svand_u32_z(active, values, bit_masks);
+        const svuint32_t diff   = svsub_u32_z(active, bit_masks, masked);
+        const bool match = (svmaxv_u32(active, diff) == 0);
+
+        // Same exit structure as AVX2 path (which also processes 8 per iter).
+        if (rem_probes <= 8) {
+          return match;
+        } else if (!match) {
+          return false;
+        }
+        // 0xab25f4c1 = golden_ratio^8 mod 2^32 (same constant as AVX2 path).
+        h *= 0xab25f4c1u;
+        rem_probes -= 8;
+      }
     }
 #elif defined(__aarch64__)
     // NEON path for AArch64. Processes 4 probes per loop iteration
